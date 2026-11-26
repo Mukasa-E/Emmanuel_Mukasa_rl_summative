@@ -4,8 +4,8 @@ Rendering utilities for AgriFieldEnv.
 Provides:
   * a thin wrapper around the environment's built-in Pygame render (GUI used
     by play.py and the video demonstration),
-  * a matplotlib-based static figure of the environment (saved to assets/ and
-    embedded in the report).
+  * a matplotlib-based static figure of the environment (crop states are masked
+    until scouted), saved to assets/ and embedded in the report.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from .custom_env import (
     CROP_DISEASED,
     CROP_MATURE,
     CROP_HARVESTED,
+    ACTION_SCAN,
 )
 
 # Colour map matching environment.custom_env.
@@ -44,6 +45,7 @@ CROP_COLOURS = {
     CROP_MATURE: "#78501e",
     CROP_HARVESTED: "#a0a0a0",
     "obstacle": "#787878",
+    "unknown": "#788287",
 }
 
 
@@ -63,9 +65,12 @@ def render_static(env: AgriFieldEnv, path: Optional[str] = None):
             if obstacles[x, y]:
                 colour = CROP_COLOURS["obstacle"]
                 hatch = "///"
-            else:
+            elif env.crop_known[x, y]:
                 colour = CROP_COLOURS.get(int(field[x, y]), "#888888")
                 hatch = None
+            else:
+                colour = CROP_COLOURS["unknown"]
+                hatch = "..."
             rect = Rectangle(
                 (y, grid_size - 1 - x), 1, 1, facecolor=colour,
                 edgecolor="#b4bec4", linewidth=0.8, hatch=hatch,
@@ -113,6 +118,8 @@ def render_static(env: AgriFieldEnv, path: Optional[str] = None):
               label="Harvested"),
         Patch(facecolor=CROP_COLOURS["obstacle"], edgecolor="#b4bec4", hatch="///",
               label="Obstacle (rock / equipment / mud)"),
+        Patch(facecolor=CROP_COLOURS["unknown"], edgecolor="#b4bec4", hatch="...",
+              label="Unknown crop state (not scouted)"),
         Patch(facecolor="#1e64c8", edgecolor="black", label="Agent"),
     ]
     ax_plt.legend(
@@ -139,4 +146,5 @@ def make_env_visual(path: str = "assets/environment_visual.png"):
     """Create a fresh environment, render it, and save the report visual."""
     env = AgriFieldEnv(grid_size=8, max_steps=200, seed=7, render_mode=None)
     env.reset()
+    env.step(ACTION_SCAN)
     return render_static(env, path=path)

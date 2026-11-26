@@ -2,8 +2,8 @@
 DQN (Deep Q-Network) training with TorchRL.
 
 Implements a value-based agent for AgriFieldEnv using:
-  * a Dueling MLP Q-network (torchrl.modules.models.DuelingMlpDQNet / MLP),
-  * QValueModule + QValueActor for action selection,
+  * a two-hidden-layer MLP Q-network,
+  * QValueActor for action selection,
   * EGreedyModule for epsilon-greedy exploration (annealed),
   * DQNLoss with a delayed target network (double DQN option),
   * ReplayBuffer with LazyTensorStorage (experience replay),
@@ -16,15 +16,15 @@ from __future__ import annotations
 
 import csv
 import os
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 from tensordict import TensorDict
-from tensordict.nn import ProbabilisticTensorDictSequential
-from torchrl.envs import GymWrapper, TransformedEnv, StepCounter, DoubleToFloat
+from tensordict.nn import TensorDictModule, TensorDictSequential
+from torchrl.envs import GymWrapper, TransformedEnv
+from torchrl.envs.transforms import Compose, DoubleToFloat, StepCounter
 from torchrl.modules import (
     QValueActor,
-    QValueModule,
     EGreedyModule,
     MLP,
 )
@@ -34,35 +34,115 @@ from torchrl.data.replay_buffers import ReplayBuffer, LazyTensorStorage
 from torchrl.collectors import SyncDataCollector
 from torch.optim import Adam
 
+from environment.action_masks import legal_action_mask
 from environment.custom_env import AgriFieldEnv
+from training.networks import build_backbone
 
 
-def make_env(grid_size: int = 8, max_steps: int = 200, seed: int = 0):
-    base = GymWrapper(AgriFieldEnv(grid_size=grid_size, max_steps=max_steps, seed=seed))
+class _LegalActionMask(torch.nn.Module):
+    def __init__(self, grid_size: int):
+        super().__init__()
+        self.grid_size = grid_size
+
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        return legal_action_mask(observation, self.grid_size)
+
+
+def make_action_mask_module(grid_size: int) -> TensorDictModule:
+    return TensorDictModule(
+        _LegalActionMask(grid_size),
+        in_keys=["observation"],
+        out_keys=["action_mask"],
+    )
+
+
+class NStepTransitionAccumulator:
+    def __init__(self, n_steps: int, gamma: float):
+        if n_steps < 1:
+            raise ValueError("n_steps must be at least 1")
+        self.n_steps = n_steps
+        self.gamma = gamma
+        self.pending: list[TensorDict] = []
+
+    def _emit(self, horizon: int) -> TensorDict:
+        transitions = self.pending[:horizon]
+        first = transitions[0]
+        result = first.clone()
+        reward = torch.zeros_like(first.get(("next", "reward")))
+
+        for offset, transition in enumerate(transitions):
+            reward += self.gamma**offset * transition.get(("next", "reward"))
+
+        result.set("next", transitions[-1].get("next").clone())
+        result.set(("next", "reward"), reward)
+        result.set(
+            "steps_to_next_obs",
+            torch.tensor(horizon, dtype=torch.int64, device=reward.device),
+        )
+        self.pending.pop(0)
+        return result
+
+    @staticmethod
+    def _stack(transitions: list[TensorDict]) -> TensorDict | None:
+        if not transitions:
+            return None
+        return TensorDict.stack(transitions, dim=0)
+
+    def push(self, batch: TensorDict) -> TensorDict | None:
+        emitted = []
+        for index in range(batch.batch_size[0]):
+            self.pending.append(batch[index].clone())
+            episode_done = bool(self.pending[-1].get(("next", "done")).any().item())
+
+            if episode_done:
+                while self.pending:
+                    emitted.append(self._emit(min(self.n_steps, len(self.pending))))
+            elif len(self.pending) >= self.n_steps:
+                emitted.append(self._emit(self.n_steps))
+
+        return self._stack(emitted)
+
+    def flush(self) -> TensorDict | None:
+        emitted = []
+        while self.pending:
+            emitted.append(self._emit(min(self.n_steps, len(self.pending))))
+        return self._stack(emitted)
+
+
+def make_env(
+    grid_size: int = 8,
+    max_steps: int = 200,
+    seed: int = 0,
+    shaping_coef: float = 0.0,
+):
+    base = GymWrapper(
+        AgriFieldEnv(
+            grid_size=grid_size,
+            max_steps=max_steps,
+            seed=seed,
+            shaping_coef=shaping_coef,
+        ),
+        categorical_action_encoding=True,
+    )
     env = TransformedEnv(
         base,
-        StepCounter(),
-        DoubleToFloat(),
+        Compose(StepCounter(), DoubleToFloat()),
     )
     env.set_seed(seed)
     return env
 
 
-def build_dqn_model(env, device: str = "cpu"):
+def build_dqn_model(env, device: str = "cpu", arch: str = "mlp"):
     obs_dim = int(env.observation_spec["observation"].shape[-1])
     act_spec = env.action_spec
     num_actions = int(act_spec.n)
 
-    qnet = MLP(
-        in_features=obs_dim,
-        out_features=num_actions,
-        num_cells=[64, 64],
-        device=device,
-    )
+    qnet = build_backbone(arch, obs_dim, num_actions, device=device)
     model = QValueActor(
         module=qnet,
         spec=act_spec,
         in_keys=["observation"],
+        action_mask_key="action_mask",
     )
     return model.to(device)
 
@@ -95,21 +175,32 @@ def train_dqn(
     target_update = int(cfg.get("target_update", 8))
     double_dqn = bool(cfg.get("double_dqn", False))
     num_opt_steps = int(cfg.get("num_opt_steps", 4))
+    n_steps = int(cfg.get("n_steps", 1))
+    arch = str(cfg.get("arch", "mlp"))
     seed = int(cfg.get("seed", env_seed))
 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    env = make_env(grid_size=grid_size, max_steps=max_steps, seed=seed)
-    model = build_dqn_model(env, device=device).to(device)
+    env = make_env(
+        grid_size=grid_size,
+        max_steps=max_steps,
+        seed=seed,
+        shaping_coef=float(cfg.get("shaping_coef", 0.0)),
+    )
+    model = build_dqn_model(env, device=device, arch=arch).to(device)
+    action_mask_module = make_action_mask_module(grid_size)
 
     exploration = EGreedyModule(
         env.action_spec,
         annealing_num_steps=eps_anneal,
         eps_init=eps_init,
         eps_end=eps_end,
+        action_mask_key="action_mask",
     )
-    explored_model = ProbabilisticTensorDictSequential(model, exploration)
+    explored_model = TensorDictSequential(
+        action_mask_module, model, exploration
+    )
 
     collector = SyncDataCollector(
         env,
@@ -123,6 +214,7 @@ def train_dqn(
         storage=LazyTensorStorage(buffer_size, device=device),
         batch_size=batch_size,
     )
+    transition_accumulator = NStepTransitionAccumulator(n_steps, gamma)
 
     loss_module = DQNLoss(
         value_network=model,
@@ -141,7 +233,7 @@ def train_dqn(
     csv_file = open(csv_path, "w", newline="")
     writer = csv.writer(csv_file)
     writer.writerow(
-        ["frame", "episode_reward", "episode_length", "epsilon", "loss"]
+        ["episode", "frame", "episode_reward", "episode_length", "epsilon", "loss"]
     )
 
     frames = 0
@@ -151,17 +243,14 @@ def train_dqn(
     last_loss = 0.0
     num_updates = 0
 
-    for batch in collector:
-        batch = batch.to(device)
-        # Expand to full tensordict for the replay buffer (add step counter etc.)
-        replay_buffer.extend(batch)
+    cfg = {**cfg, "n_steps": n_steps, "arch": arch}
 
-        # Epsilon for logging
-        epsilon = float(exploration.eps.item()) if hasattr(exploration, "eps") else eps_end
-
+    def optimize_replay():
+        nonlocal last_loss, num_updates
+        if len(replay_buffer) < batch_size:
+            return
         for _ in range(num_opt_steps):
-            sample = replay_buffer.sample()
-            sample = sample.to(device)
+            sample = replay_buffer.sample().to(device)
             loss_out = loss_module(sample)
             loss_val = loss_out.get("loss", loss_out.get("loss_dqn"))
             optimizer.zero_grad()
@@ -170,10 +259,23 @@ def train_dqn(
             last_loss = float(loss_val.detach().item())
             num_updates += 1
 
-            # DQNLoss creates the delayed network; SoftUpdate moves it toward
-            # the online network at the configured optimizer-step interval.
             if num_updates % target_update == 0:
                 soft_updater.step()
+
+    for batch in collector:
+        batch = batch.to(device)
+        batch.set(
+            ("next", "action_mask"),
+            legal_action_mask(batch.get(("next", "observation")), grid_size),
+        )
+        transitions = transition_accumulator.push(batch)
+        if transitions is not None:
+            replay_buffer.extend(transitions)
+
+        # Epsilon for logging
+        epsilon = float(exploration.eps.item()) if hasattr(exploration, "eps") else eps_end
+
+        optimize_replay()
 
         frames += batch.numel()
 
@@ -189,6 +291,7 @@ def train_dqn(
                 episode_rewards.append(episode_return)
                 writer.writerow(
                     [
+                        len(episode_rewards),
                         frames - batch.batch_size[0] + t_idx + 1,
                         episode_return,
                         episode_length,
@@ -198,13 +301,50 @@ def train_dqn(
                 )
                 episode_return = 0.0
                 episode_length = 0
+        exploration.step(batch.numel())
+
+    final_transitions = transition_accumulator.flush()
+    if final_transitions is not None:
+        replay_buffer.extend(final_transitions)
+        optimize_replay()
 
     collector.shutdown()
     env.close()
     csv_file.close()
 
-    # Evaluate the trained policy (greedy) for a few episodes
-    eval_reward = evaluate_greedy(model, grid_size=grid_size, max_steps=max_steps, seed=seed + 1000, episodes=10)
+    # Evaluate the trained policy greedily on fresh seeded episodes.
+    eval_seed = int(cfg.get("eval_seed", seed + 1000))
+    eval_reward = evaluate_greedy(
+        model,
+        grid_size=grid_size,
+        max_steps=max_steps,
+        seed=eval_seed,
+        episodes=10,
+    )
+    from baseline import evaluate_policy as evaluate_task_policy
+
+    def greedy_action(observation):
+        observation_tensor = torch.as_tensor(
+            observation, dtype=torch.float32, device=device
+        )
+        td = TensorDict({"observation": observation_tensor}, batch_size=[])
+        td.set("action_mask", legal_action_mask(observation_tensor, grid_size))
+        with torch.no_grad():
+            return int(model(td)["action"].item())
+
+    task_eval = evaluate_task_policy(
+        greedy_action,
+        policy_name="dqn",
+        grid_size=grid_size,
+        max_steps=max_steps,
+        seeds=tuple(
+            range(
+                int(cfg.get("task_eval_seed", eval_seed)),
+                int(cfg.get("task_eval_seed", eval_seed))
+                + int(cfg.get("task_eval_episodes", 20)),
+            )
+        ),
+    )
 
     # Save model
     model_path = os.path.join(model_dir, f"{run_tag}_seed{seed}.pt")
@@ -226,7 +366,15 @@ def train_dqn(
         "mean_reward_last25": float(np.mean(recent)),
         "max_reward": float(np.max(episode_rewards)) if episode_rewards else 0.0,
         "eval_greedy_reward": float(eval_reward),
+        "eval_mission_completion_rate": task_eval["mission_completion_rate"],
+        "eval_initial_task_resolution_rate": task_eval[
+            "mean_initial_task_resolution_rate"
+        ],
+        "eval_successful_interventions": task_eval[
+            "mean_successful_interventions"
+        ],
         "num_updates": num_updates,
+        "n_steps": n_steps,
         "model_path": model_path,
         "csv_path": csv_path,
         **cfg,
@@ -252,12 +400,12 @@ def evaluate_greedy(model, *, grid_size, max_steps, seed, episodes=10):
             ep_r = 0.0
             while not done:
                 td = TensorDict({"observation": obs_t}, batch_size=[])
+                td.set("action_mask", legal_action_mask(obs_t, grid_size))
                 out = model(td)
-                action = out.get("action", out.get("chosen_action"))
-                if action is None:
-                    q = out.get("action_value")
-                    action = q.argmax(-1)
-                action = action.detach().cpu()
+                q_values = out.get("action_value")
+                if q_values is None:
+                    raise RuntimeError("DQN model output is missing action values")
+                action = q_values.argmax(dim=-1).detach().cpu()
                 if action.numel() > 1:
                     action = action.argmax()
                 action = int(action.item())

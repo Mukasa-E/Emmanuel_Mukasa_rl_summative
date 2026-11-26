@@ -9,6 +9,13 @@ reinforcement-learning algorithms implemented with **TorchRL**:
 * **PPO** (proximal policy optimization)
 * **A2C** (actor-critic)
 
+DQN and policy-gradient agents use an observation-based legal-action mask:
+they avoid moves into mapped boundaries/obstacles, scans with no new nearby
+information, and treatments that conflict with an already observed crop state.
+DQN also supports terminal-aware n-step replay targets through the `n_steps`
+training setting; it defaults to one-step targets. The n-step option is still
+experimental and is not included in the existing report results.
+
 ## Mission context
 
 The environment is derived from the AgriMind AI capstone mission
@@ -16,6 +23,16 @@ The environment is derived from the AgriMind AI capstone mission
 an autonomous field agent (robot/drone) that navigates a farm plot, monitors
 crop health, and applies the right treatment (water, fertiliser, pesticide) or
 harvests at the right time — while managing battery and time.
+
+The simulated observation contains agent and mission status, a persistent
+global map of crop states already discovered, a crop-visibility mask, and a
+mapped obstacle layer. Unknown crop states remain hidden until the agent visits
+or scans them; scanning reveals the local 3×3 crop patch, while both movement
+and scanning reward each newly discovered cell. Each generated 6×6 mission begins with 6–8 crops that
+need intervention, so the 60-action battery permits scouting and treatment.
+The environment is a simulation: camera, soil, localization, and battery
+sensor sources are documented as real-world equivalents, not connected
+hardware.
 
 ## Repository layout
 
@@ -34,7 +51,7 @@ project_root/
 │
 ├── training/
 │   ├── __init__.py
-│   ├── dqn_training.py     # DQN training with TorchRL
+│   ├── dqn_training.py     # Masked-action DQN training with TorchRL
 │   └── pg_training.py      # REINFORCE / PPO / A2C training with TorchRL
 │
 ├── models/                 # Saved trained agents
@@ -43,7 +60,7 @@ project_root/
 │
 ├── logs/                   # Training logs (CSV / tensorboard)
 ├── assets/                 # Generated figures and environment visual
-└── tests/                  # Recommended (smoke tests)
+└── tests/                  # Environment and transition tests
 ```
 
 ## Getting started (uv only)
@@ -63,6 +80,12 @@ uv run main.py
 
 # 4. Run the best-performing agent with the GUI (play.py)
 uv run play.py
+
+# 5. Run the environment tests
+uv run python -m unittest discover -s tests
+
+# 6. Compare random and task-aware baselines on shared episode seeds
+uv run python baseline.py --episodes 20 --seed 100
 ```
 
 No manual virtual-environment creation or dependency installation is required.
@@ -72,17 +95,14 @@ No manual virtual-environment creation or dependency installation is required.
 The final report (PDF) follows the provided report template and is 7–10 pages.
 It documents the environment, action/observation/reward design, the four
 TorchRL implementations, the hyperparameter sweeps (10+ runs per algorithm),
-results figures, discussion, and conclusions.
+results figures, discussion, and conclusions. Running `main.py` regenerates
+the summary, training CSVs, model checkpoints, and plots in `logs/`, `models/`,
+and `assets/`.
 
 ## Video demonstration
 
-A screen-share video (camera on, ~3 minutes of agent navigation) demonstrates
-the best agent in the GUI with terminal output. See `RECORDING_NOTES.md` for the
-required narration structure.
+A screen-share video (camera on, maximum 3 minutes) should demonstrate the
+best agent in the GUI with terminal output and explain the problem, objective,
+actions, reward, learned behavior, and measured performance.
 
-## Disclaimer
 
-The AgriMind AI blueprint was used only as inspiration for the mission theme.
-This assignment strictly implements the Reinforcement Learning summative
-requirements (custom environment, four TorchRL algorithms, hyperparameter
-sweeps, report, video, GitHub repository).

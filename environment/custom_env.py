@@ -7,18 +7,6 @@ capstone (agricultural decision-support for smallholder farmers in Kenya).
 An autonomous field agent (robot / drone) navigates a farm plot, monitors crop
 health and applies the right treatment (water, fertiliser, pesticide) or
 harvests at the right time, while managing battery and time.
-
-The environment is sequential, action-dependent and non-trivial:
-  * actions change persistent crop state across the field,
-  * rewards are delayed (a diseased crop must be scouted before it can be
-    treated, and treating too early wastes scarce inputs),
-  * the agent must trade off battery consumption against coverage,
-  * terminal conditions include full-field recovery/harvest, battery depletion
-    and a step limit.
-
-Real-world mapping: every action corresponds to a capability a physical
-agricultural robot/drone can perform (drive to a plot, scan with a camera,
-irrigate, spread fertiliser, spray pesticide, harvest, wait).
 """
 
 from __future__ import annotations
@@ -30,9 +18,9 @@ import gymnasium as gym
 from gymnasium import spaces
 
 # ---------------------------------------------------------------------------
-# Crop state encoding (one value per field cell)
+# Crop state encoding
 # ---------------------------------------------------------------------------
-CROP_EMPTY = 0   # bare soil / no crop
+CROP_EMPTY = 0
 CROP_HEALTHY = 1
 CROP_NEEDS_WATER = 2
 CROP_NEEDS_FERT = 3
@@ -50,23 +38,25 @@ CROP_STATE_NAMES = {
     CROP_HARVESTED: "harvested",
 }
 
-# A crop is "done" (no further agent action required) when healthy, harvested
-# or empty.
-TERMINAL_CROP_STATES = {CROP_HEALTHY, CROP_HARVESTED, CROP_EMPTY}
+TERMINAL_CROP_STATES = {CROP_HEALTHY, CROP_HARVESTED}
+MIN_ACTIONABLE_CROPS = 6
+MAX_ACTIONABLE_CROPS = 8
+HEALTHY_DEGRADATION_PROBABILITY = 0.002
+NEEDY_DISEASE_PROBABILITY = 0.01
 
 # ---------------------------------------------------------------------------
-# Action encoding (Discrete(10))
+# Action encoding
 # ---------------------------------------------------------------------------
 ACTION_MOVE_NORTH = 0
 ACTION_MOVE_SOUTH = 1
 ACTION_MOVE_EAST = 2
 ACTION_MOVE_WEST = 3
-ACTION_SCAN = 4          # monitor / sense current cell
-ACTION_WATER = 5         # irrigate current cell
-ACTION_FERTILISE = 6     # spread fertiliser on current cell
-ACTION_SPRAY_PESTICIDE = 7  # treat disease on current cell
-ACTION_HARVEST = 8       # harvest mature crop
-ACTION_WAIT = 9          # pass one time step
+ACTION_SCAN = 4
+ACTION_WATER = 5
+ACTION_FERTILISE = 6
+ACTION_SPRAY_PESTICIDE = 7
+ACTION_HARVEST = 8
+ACTION_WAIT = 9
 
 ACTION_NAMES = {
     ACTION_MOVE_NORTH: "move_north",
@@ -85,39 +75,7 @@ NUM_ACTIONS = len(ACTION_NAMES)
 
 
 class AgriFieldEnv(gym.Env):
-    """
-    Precision-agriculture field navigation environment.
-
-    Observation (Box, float32, shape=(17,), all normalised to [0, 1]):
-        [0]   agent_x / (grid_size - 1)
-        [1]   agent_y / (grid_size - 1)
-        [2]   battery / max_battery
-        [3]   step / max_steps
-        [4:13] 3x3 local crop grid around the agent (each crop_state / 6)
-        [13]  current cell needs water        (0/1)
-        [14]  current cell needs fertiliser   (0/1)
-        [15]  current cell diseased           (0/1)
-        [16]  current cell mature             (0/1)
-
-    Action (Discrete(10)): see ACTION_NAMES above.
-
-    Reward (per step):
-        * step / wait / move penalty            : -0.1  (encourage efficiency)
-        * move into boundary / obstacle         : -2.0
-        * wrong treatment on a healthy cell     : -3.0  (wasted input)
-        * successful water on needs-water crop  : +5.0
-        * successful fertilise on needs-fert    : +5.0
-        * successful pesticide on diseased crop : +8.0
-        * successful harvest on mature crop     : +10.0
-        * scan (information-gathering)          : +0.5
-        * terminal bonus (all crops resolved)   : +50.0
-        * battery depletion                     : -20.0
-
-    Terminal conditions:
-        * every crop cell is in a terminal state (healthy / harvested / empty),
-        * battery <= 0,
-        * step >= max_steps.
-    """
+    """Precision-agriculture field navigation environment."""
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10}
 
@@ -125,11 +83,34 @@ class AgriFieldEnv(gym.Env):
         self,
         grid_size: int = 8,
         max_steps: int = 200,
-        max_battery: float = 100.0,
+        max_battery: float = 60.0,
         seed: Optional[int] = None,
         render_mode: Optional[str] = None,
+        shaping_coef: float = 0.0,
+        shaping_gamma: float = 0.99,
+        crop_dynamics_enabled: bool = True,
     ):
         super().__init__()
+
+        if isinstance(grid_size, bool) or int(grid_size) != grid_size or grid_size < 2:
+            raise ValueError("grid_size must be an integer greater than or equal to 2")
+        if isinstance(max_steps, bool) or int(max_steps) != max_steps or max_steps <= 0:
+            raise ValueError("max_steps must be a positive integer")
+        if not np.isfinite(max_battery) or max_battery <= 0:
+            raise ValueError("max_battery must be finite and greater than 0")
+        if not np.isfinite(shaping_coef):
+            raise ValueError("shaping_coef must be finite")
+        if not np.isfinite(shaping_gamma) or not 0.0 <= shaping_gamma <= 1.0:
+            raise ValueError("shaping_gamma must be between 0 and 1")
+        if render_mode not in (None, "human", "rgb_array"):
+            raise ValueError("render_mode must be None, 'human', or 'rgb_array'")
+        if not isinstance(crop_dynamics_enabled, bool):
+            raise ValueError("crop_dynamics_enabled must be a boolean")
+
+        self.shaping_coef = float(shaping_coef)
+        self.shaping_gamma = float(shaping_gamma)
+        self.crop_dynamics_enabled = crop_dynamics_enabled
+
         self.grid_size = int(grid_size)
         self.max_steps = int(max_steps)
         self.max_battery = float(max_battery)
@@ -137,274 +118,437 @@ class AgriFieldEnv(gym.Env):
 
         self.action_space = spaces.Discrete(NUM_ACTIONS)
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(17,), dtype=np.float32
+            low=0.0,
+            high=1.0,
+            shape=(4 + 3 * self.grid_size**2,),
+            dtype=np.float32,
         )
 
-        # RNG (seeded via reset / seed).
-        self.np_random: Optional[np.random.Generator] = None
+        self._rng = np.random.default_rng(seed)
         self.seed_value = seed
 
-        # Pygame rendering surface (created lazily).
         self._screen = None
         self._clock = None
         self._cell_px = 60
 
-        # Episode state (set in reset).
-        self.field: Optional[np.ndarray] = None
-        self.agent_pos: Optional[np.ndarray] = None
+        self.field = np.zeros(
+            (self.grid_size, self.grid_size), dtype=np.int64
+        )
+        self.agent_pos = np.zeros(2, dtype=int)
+        self.crop_known = np.zeros(
+            (self.grid_size, self.grid_size), dtype=bool
+        )
         self.battery: float = 0.0
         self.step_count: int = 0
-        self._prev_crop_done_count: int = 0
 
-        # Obstacle cells (immutable during an episode).
         self.obstacles: np.ndarray = np.zeros(
             (self.grid_size, self.grid_size), dtype=bool
         )
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     # Gymnasium API
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     def seed(self, seed: Optional[int] = None) -> None:
         self.seed_value = seed
-        self.np_random = np.random.default_rng(seed)
+        self._rng = np.random.default_rng(seed)
 
-    def reset(
-        self,
-        *,
-        seed: Optional[int] = None,
-        options: Optional[dict] = None,
-    ):
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
+
         if seed is not None:
             self.seed_value = seed
-        if self.np_random is None or self.seed_value != seed:
-            self.np_random = np.random.default_rng(self.seed_value)
-        rng = self.np_random
+            self._rng = np.random.default_rng(seed)
 
-        # Random initial field: mostly crops, some empty, random states.
-        self.field = rng.integers(0, 7, size=(self.grid_size, self.grid_size))
+        rng = self._rng
 
-        # Ensure there is at least one actionable crop (needs treatment /
-        # mature) so the episode is not trivially terminal.
-        actionable_mask = np.isin(
-            self.field,
-            [CROP_NEEDS_WATER, CROP_NEEDS_FERT, CROP_DISEASED, CROP_MATURE],
+        cell_count = self.grid_size * self.grid_size
+        min_targets = min(MIN_ACTIONABLE_CROPS, cell_count - 1)
+        max_targets = min(MAX_ACTIONABLE_CROPS, cell_count - 1)
+
+        target_count = int(rng.integers(min_targets, max_targets + 1))
+        target_positions = rng.choice(
+            cell_count, size=target_count, replace=False
         )
-        if not actionable_mask.any():
-            idx = rng.integers(0, self.grid_size * self.grid_size)
-            self.field.flat[idx] = int(rng.choice(
-                [CROP_NEEDS_WATER, CROP_NEEDS_FERT, CROP_DISEASED, CROP_MATURE]
-            ))
 
-        # Fixed obstacles (rocks / irrigation equipment / mud).
-        self.obstacles = rng.random(
-            (self.grid_size, self.grid_size)
-        ) < 0.08
-        # Never block the start cell or actionable cells.
+        self.field = np.full(
+            (self.grid_size, self.grid_size),
+            CROP_HEALTHY,
+            dtype=np.int64,
+        )
+
+        target_states = rng.choice(
+            [CROP_NEEDS_WATER, CROP_NEEDS_FERT, CROP_DISEASED, CROP_MATURE],
+            size=target_count,
+        )
+        self.field.flat[target_positions] = target_states
+
+        actionable_mask = np.zeros(cell_count, dtype=bool)
+        actionable_mask[target_positions] = True
+        actionable_mask = actionable_mask.reshape(
+            self.grid_size, self.grid_size
+        )
+
+        non_target_positions = np.flatnonzero(~actionable_mask.ravel())
+        empty_count = min(
+            int(rng.integers(
+                max(1, cell_count // 12),
+                max(2, cell_count // 8) + 1,
+            )),
+            len(non_target_positions),
+        )
+
+        empty_positions = rng.choice(
+            non_target_positions,
+            size=empty_count,
+            replace=False,
+        )
+        self.field.flat[empty_positions] = CROP_EMPTY
+
+        self.obstacles = (
+            rng.random((self.grid_size, self.grid_size)) < 0.08
+        )
         self.obstacles[0, 0] = False
         self.obstacles[actionable_mask] = False
 
-        # Agent starts at top-left corner.
         self.agent_pos = np.array([0, 0], dtype=int)
+        self.crop_known = np.zeros(
+            (self.grid_size, self.grid_size), dtype=bool
+        )
+        self._reveal_crop(0, 0)
+
         self.battery = self.max_battery
         self.step_count = 0
-        self._prev_crop_done_count = int(
-            np.isin(self.field, list(TERMINAL_CROP_STATES)).sum()
-        )
 
         obs = self._get_obs()
         info = self._get_info()
         return obs, info
 
     def step(self, action: int):
+        if not self.action_space.contains(action):
+            raise ValueError(f"Invalid action: {action!r}")
+
         action = int(action)
-        assert self.action_space.contains(action), f"Invalid action {action}"
 
         self.step_count += 1
-        self.battery -= 1.0  # every action consumes battery
+        self.battery -= 1.0
+
+        phi_before = (
+            self._frontier_potential() if self.shaping_coef else 0.0
+        )
 
         x, y = int(self.agent_pos[0]), int(self.agent_pos[1])
         reward = 0.0
         terminated = False
         truncated = False
+        newly_revealed = 0
 
-        # ------------------------------------------------------------------ #
         # Action handling
-        # ------------------------------------------------------------------ #
         if action == ACTION_MOVE_NORTH:
-            nx, ny = max(x - 1, 0), y
+            nx, ny = x - 1, y
             moved = self._try_move(nx, ny)
             reward += -0.1 if moved else -2.0
+            if moved:
+                newly_revealed += self._reveal_crop(nx, ny)
+
         elif action == ACTION_MOVE_SOUTH:
-            nx, ny = min(x + 1, self.grid_size - 1), y
+            nx, ny = x + 1, y
             moved = self._try_move(nx, ny)
             reward += -0.1 if moved else -2.0
+            if moved:
+                newly_revealed += self._reveal_crop(nx, ny)
+
         elif action == ACTION_MOVE_EAST:
-            nx, ny = x, min(y + 1, self.grid_size - 1)
+            nx, ny = x, y + 1
             moved = self._try_move(nx, ny)
             reward += -0.1 if moved else -2.0
+            if moved:
+                newly_revealed += self._reveal_crop(nx, ny)
+
         elif action == ACTION_MOVE_WEST:
-            nx, ny = x, max(y - 1, 0),  # type: ignore[assignment]
+            nx, ny = x, y - 1
             moved = self._try_move(nx, ny)
             reward += -0.1 if moved else -2.0
+            if moved:
+                newly_revealed += self._reveal_crop(nx, ny)
+
         elif action == ACTION_SCAN:
-            reward += 0.5  # information-gathering has a small intrinsic value
+            reward -= 0.1
+            newly_revealed += self._reveal_local_crops(x, y)
+
         elif action == ACTION_WATER:
             reward += self._treat(CROP_NEEDS_WATER, CROP_HEALTHY, 5.0)
+
         elif action == ACTION_FERTILISE:
             reward += self._treat(CROP_NEEDS_FERT, CROP_HEALTHY, 5.0)
+
         elif action == ACTION_SPRAY_PESTICIDE:
             reward += self._treat(CROP_DISEASED, CROP_HEALTHY, 8.0)
+
         elif action == ACTION_HARVEST:
             reward += self._treat(CROP_MATURE, CROP_HARVESTED, 10.0)
+
         elif action == ACTION_WAIT:
-            reward += -0.5
-            # Crops degrade over time: healthy crops may need water.
-            self._degrade_crops()
+            reward -= 0.5
 
-        # Natural degradation: untreated needy crops worsen (disease spreads).
-        if action != ACTION_WAIT:
-            self._spread_disease()
+        reward += 0.25 * newly_revealed
 
-        # ------------------------------------------------------------------ #
-        # Termination / truncation
-        # ------------------------------------------------------------------ #
+        # Crop dynamics can be disabled for controlled diagnostic experiments.
+        # Default behaviour remains unchanged: dynamics are enabled.
+        if self.crop_dynamics_enabled:
+            self._advance_crop_dynamics()
+
+        # Terminal / truncation semantics
         if self.battery <= 0:
-            reward += -20.0
+            reward -= 20.0
             terminated = True
 
-        crop_done_count = int(
-            np.isin(self.field, list(TERMINAL_CROP_STATES)).sum()
-        )
+        crop_done_count = self._resolved_crop_count()
         total_crops = int((self.field != CROP_EMPTY).sum())
+
         if total_crops > 0 and crop_done_count == total_crops:
             reward += 50.0
             terminated = True
 
-        if self.step_count >= self.max_steps:
+        if not terminated and self.step_count >= self.max_steps:
             truncated = True
 
-        self._prev_crop_done_count = crop_done_count
+        raw_reward = reward
+
+        if self.shaping_coef:
+            phi_after = (
+                0.0 if terminated else self._frontier_potential()
+            )
+            reward += self.shaping_coef * (
+                self.shaping_gamma * phi_after - phi_before
+            )
+
         obs = self._get_obs()
         info = self._get_info()
-        return obs, float(reward), bool(terminated), bool(truncated), info
 
-    # ------------------------------------------------------------------ #
+        info["newly_revealed"] = int(newly_revealed)
+        info["raw_reward"] = float(raw_reward)
+        info["mission_completed"] = bool(
+            total_crops > 0 and crop_done_count == total_crops
+        )
+
+        return (
+            obs,
+            float(reward),
+            bool(terminated),
+            bool(truncated),
+            info,
+        )
+
+    # ------------------------------------------------------------------
     # Internal helpers
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    def _reveal_crop(self, x: int, y: int) -> int:
+        if self.crop_known[x, y]:
+            return 0
+        self.crop_known[x, y] = True
+        return 1
+
+    def _reveal_local_crops(self, x: int, y: int) -> int:
+        newly_revealed = 0
+
+        for nx in range(max(0, x - 1), min(self.grid_size, x + 2)):
+            for ny in range(max(0, y - 1), min(self.grid_size, y + 2)):
+                newly_revealed += self._reveal_crop(nx, ny)
+
+        return newly_revealed
+
+    def _frontier_potential(self) -> float:
+        start = (int(self.agent_pos[0]), int(self.agent_pos[1]))
+        g = self.grid_size
+
+        seen = {start}
+        frontier = [start]
+        dist = 0
+
+        while frontier:
+            nxt = []
+
+            for cx, cy in frontier:
+                if not self.crop_known[cx, cy]:
+                    return -float(dist)
+
+                for dx, dy in ((-1, 0), (1, 0), (0, 1), (0, -1)):
+                    nx, ny = cx + dx, cy + dy
+
+                    if (
+                        0 <= nx < g
+                        and 0 <= ny < g
+                        and not self.obstacles[nx, ny]
+                        and (nx, ny) not in seen
+                    ):
+                        seen.add((nx, ny))
+                        nxt.append((nx, ny))
+
+            frontier = nxt
+            dist += 1
+
+        return 0.0
+
+    def _resolved_crop_count(self) -> int:
+        crop_cells = self.field != CROP_EMPTY
+        resolved = np.isin(
+            self.field, list(TERMINAL_CROP_STATES)
+        )
+        return int(np.logical_and(crop_cells, resolved).sum())
+
     def _try_move(self, nx: int, ny: int) -> bool:
-        """Attempt to move the agent; blocked by obstacles/boundaries."""
+        if not (0 <= nx < self.grid_size and 0 <= ny < self.grid_size):
+            return False
+
         if self.obstacles[nx, ny]:
             return False
+
         self.agent_pos = np.array([nx, ny], dtype=int)
         return True
 
-    def _treat(self, required_state: int, next_state: int, success_reward: float) -> float:
-        """Apply a treatment to the current cell. Returns the step reward."""
+    def _treat(
+        self,
+        required_state: int,
+        next_state: int,
+        success_reward: float,
+    ) -> float:
         x, y = int(self.agent_pos[0]), int(self.agent_pos[1])
+
+        if not self.crop_known[x, y]:
+            return -0.5
+
         if self.field[x, y] == required_state:
             self.field[x, y] = next_state
             return float(success_reward)
-        # Wrong treatment or nothing to treat: wasted input / effort.
+
         if self.field[x, y] == CROP_HEALTHY:
             return -3.0
+
         return -0.1
 
-    def _degrade_crops(self) -> None:
-        """Wait-action degradation: healthy crops can become thirsty."""
-        for x in range(self.grid_size):
-            for y in range(self.grid_size):
-                if self.field[x, y] == CROP_HEALTHY and self.np_random.random() < 0.05:
-                    self.field[x, y] = CROP_NEEDS_WATER
+    def _advance_crop_dynamics(self) -> None:
+        self._degrade_crops()
+        self._progress_disease()
 
-    def _spread_disease(self) -> None:
-        """Slow disease progression: needy crops can become diseased."""
-        for x in range(self.grid_size):
-            for y in range(self.grid_size):
-                state = self.field[x, y]
-                if state in (CROP_NEEDS_WATER, CROP_NEEDS_FERT):
-                    if self.np_random.random() < 0.03:
-                        self.field[x, y] = CROP_DISEASED
+    def _degrade_crops(self) -> None:
+        mask = self.field == CROP_HEALTHY
+        random_values = self._rng.random(self.field.shape)
+
+        self.field[
+            mask & (random_values < HEALTHY_DEGRADATION_PROBABILITY)
+        ] = CROP_NEEDS_WATER
+
+    def _progress_disease(self) -> None:
+        needy = np.isin(
+            self.field, (CROP_NEEDS_WATER, CROP_NEEDS_FERT)
+        )
+        random_values = self._rng.random(self.field.shape)
+
+        self.field[
+            needy & (random_values < NEEDY_DISEASE_PROBABILITY)
+        ] = CROP_DISEASED
 
     def _get_obs(self) -> np.ndarray:
         x, y = int(self.agent_pos[0]), int(self.agent_pos[1])
-        # 3x3 local crop window around the agent (clipped at borders).
-        local = np.zeros((3, 3), dtype=np.float32)
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < self.grid_size and 0 <= ny < self.grid_size:
-                    local[dx + 1, dy + 1] = self.field[nx, ny] / 6.0
 
-        cur = float(self.field[x, y])
+        crop_map = np.where(
+            self.crop_known, self.field / 6.0, 0.0
+        ).astype(np.float32)
+
+        visibility = self.crop_known.astype(np.float32)
+        obstacle_map = self.obstacles.astype(np.float32)
+
         obs = np.array(
             [
                 x / (self.grid_size - 1),
                 y / (self.grid_size - 1),
                 self.battery / self.max_battery,
                 self.step_count / self.max_steps,
-                *local.flatten(),
-                float(cur == CROP_NEEDS_WATER),
-                float(cur == CROP_NEEDS_FERT),
-                float(cur == CROP_DISEASED),
-                float(cur == CROP_MATURE),
+                *crop_map.flatten(),
+                *visibility.flatten(),
+                *obstacle_map.flatten(),
             ],
             dtype=np.float32,
         )
+
         return obs
 
     def _get_info(self) -> dict:
         x, y = int(self.agent_pos[0]), int(self.agent_pos[1])
+        total_crops = int((self.field != CROP_EMPTY).sum())
+
         return {
             "agent_pos": (int(x), int(y)),
             "battery": float(self.battery),
             "step": int(self.step_count),
-            "current_cell": CROP_STATE_NAMES.get(int(self.field[x, y]), "unknown"),
-            "crops_resolved": int(
-                np.isin(self.field, list(TERMINAL_CROP_STATES)).sum()
+            "current_cell": (
+                CROP_STATE_NAMES.get(int(self.field[x, y]), "unknown")
+                if self.crop_known[x, y]
+                else "unknown"
             ),
-            "total_crops": int((self.field != CROP_EMPTY).sum()),
+            "crops_resolved": self._resolved_crop_count(),
+            "total_crops": total_crops,
         }
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     # Rendering
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     def render(self):
         if self.render_mode == "human":
             return self._render_human()
+
         if self.render_mode == "rgb_array":
             return self._render_rgb()
+
         return None
 
     def _render_human(self):
         try:
-            import pygame  # type: ignore
+            import pygame
         except ImportError as exc:
-            raise RuntimeError("pygame is required for human rendering") from exc
+            raise RuntimeError(
+                "pygame is required for human rendering"
+            ) from exc
 
         if self._screen is None:
             pygame.init()
             size = self.grid_size * self._cell_px
             self._screen = pygame.display.set_mode((size, size + 40))
-            pygame.display.set_caption("AgriFieldEnv - Precision Agriculture RL")
+            pygame.display.set_caption(
+                "AgriFieldEnv - Precision Agriculture RL"
+            )
             self._clock = pygame.time.Clock()
 
-        self._screen.fill((220, 230, 220))  # light soil background
+        self._screen.fill((220, 230, 220))
+        unknown_font = pygame.font.SysFont(None, 30)
 
-        # Draw field.
         for x in range(self.grid_size):
             for y in range(self.grid_size):
                 rect = pygame.Rect(
-                    y * self._cell_px, x * self._cell_px, self._cell_px, self._cell_px
+                    y * self._cell_px,
+                    x * self._cell_px,
+                    self._cell_px,
+                    self._cell_px,
                 )
-                state = int(self.field[x, y])
-                color = self._crop_color(state)
+
                 if self.obstacles[x, y]:
-                    color = (120, 120, 120)  # obstacle = grey
+                    color = (120, 120, 120)
+                elif self.crop_known[x, y]:
+                    color = self._crop_color(int(self.field[x, y]))
+                else:
+                    color = (120, 130, 135)
+
                 pygame.draw.rect(self._screen, color, rect)
                 pygame.draw.rect(self._screen, (180, 190, 180), rect, 1)
 
-        # Draw agent.
+                if not self.obstacles[x, y] and not self.crop_known[x, y]:
+                    marker = unknown_font.render(
+                        "?", True, (245, 245, 245)
+                    )
+                    self._screen.blit(
+                        marker, marker.get_rect(center=rect.center)
+                    )
+
         ax, ay = int(self.agent_pos[0]), int(self.agent_pos[1])
         agent_rect = pygame.Rect(
             ay * self._cell_px + 8,
@@ -412,9 +556,10 @@ class AgriFieldEnv(gym.Env):
             self._cell_px - 16,
             self._cell_px - 16,
         )
-        pygame.draw.ellipse(self._screen, (30, 100, 200), agent_rect)
+        pygame.draw.ellipse(
+            self._screen, (30, 100, 200), agent_rect
+        )
 
-        # HUD.
         self._draw_hud()
 
         pygame.display.flip()
@@ -422,9 +567,11 @@ class AgriFieldEnv(gym.Env):
 
     def _render_rgb(self) -> np.ndarray:
         try:
-            import pygame  # type: ignore
+            import pygame
         except ImportError as exc:
-            raise RuntimeError("pygame is required for rgb_array rendering") from exc
+            raise RuntimeError(
+                "pygame is required for rgb_array rendering"
+            ) from exc
 
         if self._screen is None:
             pygame.init()
@@ -432,17 +579,34 @@ class AgriFieldEnv(gym.Env):
             self._screen = pygame.Surface((size, size + 40))
 
         self._screen.fill((220, 230, 220))
+        unknown_font = pygame.font.SysFont(None, 30)
+
         for x in range(self.grid_size):
             for y in range(self.grid_size):
                 rect = pygame.Rect(
-                    y * self._cell_px, x * self._cell_px, self._cell_px, self._cell_px
+                    y * self._cell_px,
+                    x * self._cell_px,
+                    self._cell_px,
+                    self._cell_px,
                 )
-                state = int(self.field[x, y])
-                color = self._crop_color(state)
+
                 if self.obstacles[x, y]:
                     color = (120, 120, 120)
+                elif self.crop_known[x, y]:
+                    color = self._crop_color(int(self.field[x, y]))
+                else:
+                    color = (120, 130, 135)
+
                 pygame.draw.rect(self._screen, color, rect)
                 pygame.draw.rect(self._screen, (180, 190, 180), rect, 1)
+
+                if not self.obstacles[x, y] and not self.crop_known[x, y]:
+                    marker = unknown_font.render(
+                        "?", True, (245, 245, 245)
+                    )
+                    self._screen.blit(
+                        marker, marker.get_rect(center=rect.center)
+                    )
 
         ax, ay = int(self.agent_pos[0]), int(self.agent_pos[1])
         agent_rect = pygame.Rect(
@@ -451,10 +615,12 @@ class AgriFieldEnv(gym.Env):
             self._cell_px - 16,
             self._cell_px - 16,
         )
-        pygame.draw.ellipse(self._screen, (30, 100, 200), agent_rect)
+        pygame.draw.ellipse(
+            self._screen, (30, 100, 200), agent_rect
+        )
 
         arr = pygame.surfarray.array3d(self._screen)
-        return np.transpose(arr, (1, 0, 2))  # (H, W, C)
+        return np.transpose(arr, (1, 0, 2))
 
     def _crop_color(self, state: int):
         palette = {
@@ -470,28 +636,34 @@ class AgriFieldEnv(gym.Env):
 
     def _draw_hud(self):
         try:
-            import pygame  # type: ignore
+            import pygame
         except ImportError:
             return
+
         font = pygame.font.SysFont(None, 24)
         x, y = int(self.agent_pos[0]), int(self.agent_pos[1])
+        info = self._get_info()
+
         lines = [
             f"Step: {self.step_count}   Battery: {int(self.battery)}/{int(self.max_battery)}",
-            f"Pos: ({x},{y})   Cell: {CROP_STATE_NAMES.get(int(self.field[x, y]),'?')}",
-            f"Crops resolved: {self._get_info()['crops_resolved']}/"
-            f"{self._get_info()['total_crops']}",
+            f"Pos: ({x},{y})   Cell: {info['current_cell']}",
+            f"Crops resolved: {info['crops_resolved']}/{info['total_crops']}",
         ]
+
         for i, line in enumerate(lines):
             surf = font.render(line, True, (0, 0, 0))
-            self._screen.blit(surf, (10, self.grid_size * self._cell_px + 5 + i * 22))
+            self._screen.blit(
+                surf,
+                (10, self.grid_size * self._cell_px + 5 + i * 22),
+            )
 
     def close(self):
         if self._screen is not None:
             try:
-                import pygame  # type: ignore
-
+                import pygame
                 pygame.quit()
             except ImportError:
                 pass
+
             self._screen = None
             self._clock = None
